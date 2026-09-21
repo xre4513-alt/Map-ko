@@ -36,27 +36,24 @@ jobs:
           cache: true
           cache-key: flutter-stable-${{ runner.os }}
 
-      - name: Prepare full Flutter project automatically
+      - name: Scaffold Android platform files
         run: |
           set -e
-          flutter --version
-          dart --version
-          java -version
           flutter config --enable-android
           flutter config --no-analytics
 
-          if [ ! -f pubspec.yaml ]; then
-            flutter create . --platforms=android --project-name=india_offline_map --org=com.indiamap.app || true
-          fi
+          # Generate android/ scaffolding into a temp dir so it never touches our code
+          rm -rf /tmp/scaffold
+          flutter create /tmp/scaffold --platforms=android --project-name=india_offline_map --org=com.indiamap.app
 
-          if [ ! -f android/app/build.gradle ] && [ ! -f android/app/build.gradle.kts ]; then
-            flutter create . --platforms=android --project-name=india_offline_map --org=com.indiamap.app || true
-          fi
+          mkdir -p android
+          cp -r /tmp/scaffold/android/. android/
 
           mkdir -p assets lib apk-output
 
-          if [ ! -f pubspec.yaml ]; then
-            cat > pubspec.yaml <<'EOF'
+      - name: Force-write pubspec.yaml with all required deps
+        run: |
+          cat > pubspec.yaml <<'EOF'
           name: india_offline_map
           description: Offline India Map Application with GPS
           publish_to: 'none'
@@ -74,6 +71,7 @@ jobs:
             path_provider: ^2.1.3
             geolocator: ^11.0.0
             permission_handler: ^11.3.1
+            flutter_map_cancellable_tile_provider: ^2.0.0
 
           dev_dependencies:
             flutter_test:
@@ -85,43 +83,24 @@ jobs:
             assets:
               - assets/
           EOF
-          fi
+          echo "=== pubspec.yaml written ==="
+          cat pubspec.yaml
 
-          # Clean broken deps from existing pubspec.yaml
-          python3 - <<'PY'
-          import re, pathlib
-          p = pathlib.Path("pubspec.yaml")
-          txt = p.read_text()
-          txt = re.sub(r"^\s*flutter_map_mbtiles\s*:.*\n", "", txt, flags=re.M)
-          txt = re.sub(r"^\s*maplibre_gl\s*:.*\n", "", txt, flags=re.M)
-          required = [
-              ("flutter_map", "flutter_map: ^6.1.0"),
-              ("latlong2", "latlong2: ^0.9.0"),
-              ("path_provider", "path_provider: ^2.1.3"),
-              ("geolocator", "geolocator: ^11.0.0"),
-              ("permission_handler", "permission_handler: ^11.3.1"),
-          ]
-          m = re.search(r"^dependencies:\s*\n", txt, flags=re.M)
-          if not m:
-              txt += "\ndependencies:\n  flutter:\n    sdk: flutter\n"
-              m = re.search(r"^dependencies:\s*\n", txt, flags=re.M)
-          for key, line in required:
-              if re.search(rf"^\s*{re.escape(key)}\s*:", txt, flags=re.M) is None:
-                  txt = txt[:m.end()] + "  " + line + "\n" + txt[m.end():]
-          if "assets:" not in txt:
-              txt += "\nflutter:\n  uses-material-design: true\n  assets:\n    - assets/\n"
-          p.write_text(txt)
-          PY
-
-          # Write main.dart if missing
-          if [ ! -f lib/main.dart ]; then
-            cat > lib/main.dart <<'EOF'
+      - name: Force-write main.dart with India map + GPS
+        run: |
+          mkdir -p lib
+          cat > lib/main.dart <<'EOF'
+          import 'dart:async';
           import 'package:flutter/material.dart';
           import 'package:flutter_map/flutter_map.dart';
           import 'package:latlong2/latlong.dart';
           import 'package:geolocator/geolocator.dart';
+          import 'package:permission_handler/permission_handler.dart';
 
-          void main() => runApp(const IndiaMapApp());
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const IndiaMapApp());
+          }
 
           class IndiaMapApp extends StatelessWidget {
             const IndiaMapApp({super.key});
@@ -144,69 +123,191 @@ jobs:
 
           class _MapScreenState extends State<MapScreen> {
             final MapController _controller = MapController();
+            final LatLng _indiaCenter = const LatLng(20.5937, 78.9629);
             LatLng? _current;
+            bool _loading = true;
+            String _status = 'Starting...';
+            StreamSubscription<Position>? _posSub;
 
             @override
             void initState() {
               super.initState();
-              _getLocation();
+              _bootstrap();
             }
 
-            Future<void> _getLocation() async {
-              try {
-                var perm = await Geolocator.checkPermission();
-                if (perm == LocationPermission.denied) {
-                  perm = await Geolocator.requestPermission();
-                }
-                if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) return;
-                final pos = await Geolocator.getCurrentPosition();
-                if (!mounted) return;
-                setState(() => _current = LatLng(pos.latitude, pos.longitude));
-                _controller.move(_current!, 12);
-              } catch (e) {
-                debugPrint('Location error: $e');
+            Future<void> _bootstrap() async {
+              setState(() {
+                _loading = true;
+                _status = 'Requesting permissions...';
+              });
+
+              // Ask runtime permissions
+              final loc = await Permission.location.request();
+              if (!loc.isGranted) {
+                setState(() {
+                  _loading = false;
+                  _status = 'Location permission denied';
+                });
+                return;
               }
+
+              final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+              if (!serviceEnabled) {
+                setState(() {
+                  _loading = false;
+                  _status = 'Please enable GPS / Location services';
+                });
+                return;
+              }
+
+              setState(() => _status = 'Getting current location...');
+
+              try {
+                final pos = await Geolocator.getCurrentPosition(
+                  desiredAccuracy: LocationAccuracy.high,
+                  timeLimit: const Duration(seconds: 20),
+                );
+                if (!mounted) return;
+                setState(() {
+                  _current = LatLng(pos.latitude, pos.longitude);
+                  _loading = false;
+                  _status = 'Location found';
+                });
+                _controller.move(_current!, 14);
+
+                // Continuous updates
+                _posSub = Geolocator.getPositionStream(
+                  locationSettings: const LocationSettings(
+                    accuracy: LocationAccuracy.high,
+                    distanceFilter: 5,
+                  ),
+                ).listen((p) {
+                  if (!mounted) return;
+                  setState(() => _current = LatLng(p.latitude, p.longitude));
+                });
+              } catch (e) {
+                if (!mounted) return;
+                setState(() {
+                  _loading = false;
+                  _status = 'Location error: $e';
+                });
+              }
+            }
+
+            Future<void> _recenter() async {
+              if (_current == null) {
+                await _bootstrap();
+                return;
+              }
+              _controller.move(_current!, 14);
+            }
+
+            @override
+            void dispose() {
+              _posSub?.cancel();
+              super.dispose();
             }
 
             @override
             Widget build(BuildContext context) {
               return Scaffold(
-                appBar: AppBar(title: const Text('India Offline Map')),
-                body: FlutterMap(
-                  mapController: _controller,
-                  options: const MapOptions(
-                    initialCenter: LatLng(20.5937, 78.9629),
-                    initialZoom: 5,
-                    minZoom: 3,
-                    maxZoom: 18,
-                  ),
+                appBar: AppBar(
+                  title: const Text('India Map'),
+                  backgroundColor: Colors.orange,
+                ),
+                body: Stack(
                   children: [
-                    TileLayer(
-                      urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                      userAgentPackageName: 'com.indiamap.app',
-                    ),
-                    if (_current != null)
-                      MarkerLayer(markers: [
-                        Marker(
-                          point: _current!,
-                          width: 40,
-                          height: 40,
-                          child: const Icon(Icons.location_on, color: Colors.red, size: 40),
+                    FlutterMap(
+                      mapController: _controller,
+                      options: MapOptions(
+                        initialCenter: _current ?? _indiaCenter,
+                        initialZoom: _current != null ? 14 : 5,
+                        minZoom: 3,
+                        maxZoom: 18,
+                        onTap: (_, __) {},
+                      ),
+                      children: [
+                        TileLayer(
+                          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                          userAgentPackageName: 'com.indiamap.app',
+                          maxZoom: 19,
                         ),
-                      ]),
+                        if (_current != null)
+                          MarkerLayer(
+                            markers: [
+                              Marker(
+                                point: _current!,
+                                width: 60,
+                                height: 60,
+                                child: const Icon(
+                                  Icons.location_on,
+                                  color: Colors.red,
+                                  size: 50,
+                                ),
+                              ),
+                            ],
+                          ),
+                      ],
+                    ),
+                    if (_loading)
+                      Container(
+                        color: Colors.black45,
+                        alignment: Alignment.center,
+                        child: const CircularProgressIndicator(color: Colors.white),
+                      ),
+                    Positioned(
+                      left: 12,
+                      right: 12,
+                      bottom: 12,
+                      child: Card(
+                        child: Padding(
+                          padding: const EdgeInsets.all(10),
+                          child: Text(
+                            _status,
+                            style: const TextStyle(fontSize: 12),
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                      ),
+                    ),
                   ],
                 ),
-                floatingActionButton: FloatingActionButton(
-                  onPressed: _getLocation,
-                  child: const Icon(Icons.my_location),
+                floatingActionButton: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    FloatingActionButton.small(
+                      heroTag: 'zoomin',
+                      onPressed: () {
+                        final c = _controller.camera;
+                        _controller.move(c.center, c.zoom + 1);
+                      },
+                      child: const Icon(Icons.add),
+                    ),
+                    const SizedBox(height: 8),
+                    FloatingActionButton.small(
+                      heroTag: 'zoomout',
+                      onPressed: () {
+                        final c = _controller.camera;
+                        _controller.move(c.center, c.zoom - 1);
+                      },
+                      child: const Icon(Icons.remove),
+                    ),
+                    const SizedBox(height: 8),
+                    FloatingActionButton(
+                      heroTag: 'locate',
+                      onPressed: _recenter,
+                      child: const Icon(Icons.my_location),
+                    ),
+                  ],
                 ),
               );
             }
           }
           EOF
-          fi
+          echo "=== main.dart written ($(wc -l < lib/main.dart) lines) ==="
 
-          # Write a clean, valid AndroidManifest.xml (overwrite any broken one)
+      - name: Force-write AndroidManifest.xml
+        run: |
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           mkdir -p "$(dirname "$MANIFEST")"
           cat > "$MANIFEST" <<'EOF'
@@ -218,7 +319,7 @@ jobs:
               <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
               <application
-                  android:label="india_offline_map"
+                  android:label="India Map"
                   android:name="${applicationName}"
                   android:icon="@mipmap/ic_launcher">
                   <activity
@@ -252,11 +353,10 @@ jobs:
               </queries>
           </manifest>
           EOF
+          python3 -c "import xml.etree.ElementTree as ET; ET.parse('$MANIFEST'); print('Manifest OK')"
 
-          # Validate XML
-          python3 -c "import xml.etree.ElementTree as ET; ET.parse('$MANIFEST'); print('Manifest is valid XML')"
-
-          # Enable AndroidX + multidex
+      - name: Configure gradle.properties
+        run: |
           GP="android/gradle.properties"
           [ -f "$GP" ] || touch "$GP"
           grep -q "android.useAndroidX" "$GP" || echo "android.useAndroidX=true" >> "$GP"
