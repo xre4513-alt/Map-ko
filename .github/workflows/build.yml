@@ -1,0 +1,277 @@
+name: Auto Build Flutter India Offline Map APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Auto Build & Upload APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+          cache-key: flutter-stable-${{ runner.os }}
+
+      - name: Prepare full Flutter project automatically
+        run: |
+          set -e
+          flutter --version
+          dart --version
+          java -version
+          flutter config --enable-android
+          flutter config --no-analytics
+
+          # Create base project if missing
+          if [ ! -f pubspec.yaml ]; then
+            flutter create . --platforms=android --project-name=india_offline_map --org=com.indiamap.app || true
+          fi
+
+          # If android platform missing, generate it
+          if [ ! -f android/app/build.gradle ] && [ ! -f android/app/build.gradle.kts ]; then
+            flutter create . --platforms=android --project-name=india_offline_map --org=com.indiamap.app || true
+          fi
+
+          mkdir -p assets lib apk-output
+
+          # Write pubspec.yaml if missing
+          if [ ! -f pubspec.yaml ]; then
+            cat > pubspec.yaml <<'EOF'
+          name: india_offline_map
+          description: Offline India Map Application with GPS
+          publish_to: 'none'
+          version: 1.0.0+1
+
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            cupertino_icons: ^1.0.6
+            flutter_map: ^6.1.0
+            maplibre_gl: ^0.19.0
+            latlong2: ^0.9.0
+            flutter_map_mbtiles: ^1.0.5
+            path_provider: ^2.1.3
+            geolocator: ^11.0.0
+            permission_handler: ^11.3.1
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^3.0.0
+
+          flutter:
+            uses-material-design: true
+            assets:
+              - assets/
+          EOF
+          fi
+
+          # Ensure dependencies present
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("pubspec.yaml")
+          txt = p.read_text()
+          required = [
+              ("flutter_map", "flutter_map: ^6.1.0"),
+              ("maplibre_gl", "maplibre_gl: ^0.19.0"),
+              ("latlong2", "latlong2: ^0.9.0"),
+              ("flutter_map_mbtiles", "flutter_map_mbtiles: ^1.0.5"),
+              ("path_provider", "path_provider: ^2.1.3"),
+              ("geolocator", "geolocator: ^11.0.0"),
+              ("permission_handler", "permission_handler: ^11.3.1"),
+          ]
+          m = re.search(r"^dependencies:\s*\n", txt, flags=re.M)
+          if not m:
+              txt += "\ndependencies:\n  flutter:\n    sdk: flutter\n"
+              m = re.search(r"^dependencies:\s*\n", txt, flags=re.M)
+          for key, line in required:
+              if re.search(rf"^\s*{re.escape(key)}\s*:", txt, flags=re.M) is None:
+                  txt = txt[:m.end()] + "  " + line + "\n" + txt[m.end():]
+          if "assets:" not in txt:
+              txt += "\nflutter:\n  uses-material-design: true\n  assets:\n    - assets/\n"
+          p.write_text(txt)
+          PY
+
+          # Write main.dart if missing
+          if [ ! -f lib/main.dart ]; then
+            cat > lib/main.dart <<'EOF'
+          import 'dart:io';
+          import 'package:flutter/material.dart';
+          import 'package:flutter_map/flutter_map.dart';
+          import 'package:latlong2/latlong.dart';
+          import 'package:geolocator/geolocator.dart';
+          import 'package:path_provider/path_provider.dart';
+
+          void main() => runApp(const IndiaMapApp());
+
+          class IndiaMapApp extends StatelessWidget {
+            const IndiaMapApp({super.key});
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'India Offline Map',
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.orange),
+                home: const MapScreen(),
+              );
+            }
+          }
+
+          class MapScreen extends StatefulWidget {
+            const MapScreen({super.key});
+            @override
+            State<MapScreen> createState() => _MapScreenState();
+          }
+
+          class _MapScreenState extends State<MapScreen> {
+            final MapController _controller = MapController();
+            LatLng? _current;
+
+            @override
+            void initState() {
+              super.initState();
+              _getLocation();
+            }
+
+            Future<void> _getLocation() async {
+              try {
+                var perm = await Geolocator.checkPermission();
+                if (perm == LocationPermission.denied) {
+                  perm = await Geolocator.requestPermission();
+                }
+                if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) return;
+                final pos = await Geolocator.getCurrentPosition();
+                if (!mounted) return;
+                setState(() => _current = LatLng(pos.latitude, pos.longitude));
+                _controller.move(_current!, 12);
+              } catch (e) {
+                debugPrint('Location error: $e');
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: const Text('India Offline Map')),
+                body: FlutterMap(
+                  mapController: _controller,
+                  options: const MapOptions(
+                    initialCenter: LatLng(20.5937, 78.9629),
+                    initialZoom: 5,
+                    minZoom: 3,
+                    maxZoom: 18,
+                  ),
+                  children: [
+                    TileLayer(
+                      urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                      userAgentPackageName: 'com.indiamap.app',
+                    ),
+                    if (_current != null)
+                      MarkerLayer(markers: [
+                        Marker(
+                          point: _current!,
+                          width: 40,
+                          height: 40,
+                          child: const Icon(Icons.location_on, color: Colors.red, size: 40),
+                        ),
+                      ]),
+                  ],
+                ),
+                floatingActionButton: FloatingActionButton(
+                  onPressed: _getLocation,
+                  child: const Icon(Icons.my_location),
+                ),
+              );
+            }
+          }
+          EOF
+          fi
+
+          # Fix AndroidManifest permissions
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ]; then
+            python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("android/app/src/main/AndroidManifest.xml")
+          xml = p.read_text()
+          perms = [
+              '<uses-permission android:name="android.permission.INTERNET"/>',
+              '<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>',
+              '<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>',
+              '<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>',
+              '<uses-permission android:name="android.permission.WAKE_LOCK"/>',
+          ]
+          for perm in perms:
+              if perm not in xml:
+                  xml = xml.replace("<manifest", perm + "\n<manifest", 1)
+          p.write_text(xml)
+          PY
+          fi
+
+          # Enable AndroidX + multidex
+          GP="android/gradle.properties"
+          [ -f "$GP" ] || touch "$GP"
+          grep -q "android.useAndroidX" "$GP" || echo "android.useAndroidX=true" >> "$GP"
+          grep -q "android.enableJetifier" "$GP" || echo "android.enableJetifier=true" >> "$GP"
+          grep -q "org.gradle.jvmargs" "$GP" || echo "org.gradle.jvmargs=-Xmx4096m" >> "$GP"
+
+      - name: Fetch dependencies
+        run: flutter pub get
+
+      - name: Clean previous build
+        run: flutter clean
+
+      - name: Fetch dependencies again
+        run: flutter pub get
+
+      - name: Build Release APK
+        run: flutter build apk --release --split-per-abi
+
+      - name: Prepare APK output
+        run: |
+          set -e
+          VERSION=$(grep '^version:' pubspec.yaml | awk '{print $2}' | tr -d '\r' | cut -d'+' -f1)
+          DATE=$(date +'%Y%m%d-%H%M')
+          OUT="build/app/outputs/flutter-apk"
+          mkdir -p apk-output
+          for f in "$OUT"/*.apk; do
+            [ -e "$f" ] || continue
+            BASE=$(basename "$f" .apk)
+            cp "$f" "apk-output/${BASE}-${VERSION}-${DATE}.apk"
+          done
+          ls -lh apk-output/
+
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: india-offline-map-apk
+          path: apk-output/*.apk
+          if-no-files-found: error
+          retention-days: 30
