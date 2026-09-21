@@ -41,21 +41,17 @@ jobs:
           set -e
           flutter config --enable-android
           flutter config --no-analytics
-
-          # Generate android/ scaffolding into a temp dir so it never touches our code
           rm -rf /tmp/scaffold
           flutter create /tmp/scaffold --platforms=android --project-name=india_offline_map --org=com.indiamap.app
-
           mkdir -p android
           cp -r /tmp/scaffold/android/. android/
-
           mkdir -p assets lib apk-output
 
-      - name: Force-write pubspec.yaml with all required deps
+      - name: Force-write pubspec.yaml
         run: |
           cat > pubspec.yaml <<'EOF'
           name: india_offline_map
-          description: Offline India Map Application with GPS
+          description: India Map with GPS - Google Maps style
           publish_to: 'none'
           version: 1.0.0+1
 
@@ -71,7 +67,6 @@ jobs:
             path_provider: ^2.1.3
             geolocator: ^11.0.0
             permission_handler: ^11.3.1
-            flutter_map_cancellable_tile_provider: ^2.0.0
 
           dev_dependencies:
             flutter_test:
@@ -83,10 +78,8 @@ jobs:
             assets:
               - assets/
           EOF
-          echo "=== pubspec.yaml written ==="
-          cat pubspec.yaml
 
-      - name: Force-write main.dart with India map + GPS
+      - name: Force-write main.dart (Google Maps style)
         run: |
           mkdir -p lib
           cat > lib/main.dart <<'EOF'
@@ -107,13 +100,15 @@ jobs:
             @override
             Widget build(BuildContext context) {
               return MaterialApp(
-                title: 'India Offline Map',
+                title: 'India Map',
                 debugShowCheckedModeBanner: false,
                 theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.orange),
                 home: const MapScreen(),
               );
             }
           }
+
+          enum MapLayer { standard, satellite, terrain }
 
           class MapScreen extends StatefulWidget {
             const MapScreen({super.key});
@@ -125,9 +120,25 @@ jobs:
             final MapController _controller = MapController();
             final LatLng _indiaCenter = const LatLng(20.5937, 78.9629);
             LatLng? _current;
+            double _heading = 0;
             bool _loading = true;
+            bool _followMe = true;
             String _status = 'Starting...';
             StreamSubscription<Position>? _posSub;
+            MapLayer _layer = MapLayer.standard;
+
+            String get _urlTemplate {
+              switch (_layer) {
+                case MapLayer.satellite:
+                  return 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+                case MapLayer.terrain:
+                  return 'https://tile.opentopomap.org/{z}/{x}/{y}.png';
+                case MapLayer.standard:
+                  return 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+              }
+            }
+
+            bool get _isSatellite => _layer == MapLayer.satellite;
 
             @override
             void initState() {
@@ -141,7 +152,6 @@ jobs:
                 _status = 'Requesting permissions...';
               });
 
-              // Ask runtime permissions
               final loc = await Permission.location.request();
               if (!loc.isGranted) {
                 setState(() {
@@ -164,26 +174,34 @@ jobs:
 
               try {
                 final pos = await Geolocator.getCurrentPosition(
-                  desiredAccuracy: LocationAccuracy.high,
-                  timeLimit: const Duration(seconds: 20),
+                  desiredAccuracy: LocationAccuracy.best,
+                  timeLimit: const Duration(seconds: 25),
                 );
                 if (!mounted) return;
                 setState(() {
                   _current = LatLng(pos.latitude, pos.longitude);
+                  _heading = pos.heading;
                   _loading = false;
                   _status = 'Location found';
                 });
-                _controller.move(_current!, 14);
+                _controller.move(_current!, 18);
 
-                // Continuous updates
+                // 1 meter live tracking
                 _posSub = Geolocator.getPositionStream(
                   locationSettings: const LocationSettings(
-                    accuracy: LocationAccuracy.high,
-                    distanceFilter: 5,
+                    accuracy: LocationAccuracy.best,
+                    distanceFilter: 1,
                   ),
                 ).listen((p) {
                   if (!mounted) return;
-                  setState(() => _current = LatLng(p.latitude, p.longitude));
+                  setState(() {
+                    _current = LatLng(p.latitude, p.longitude);
+                    _heading = p.heading;
+                    _status = 'Live • ${p.accuracy.toStringAsFixed(1)}m accuracy';
+                  });
+                  if (_followMe) {
+                    _controller.move(_current!, _controller.camera.zoom);
+                  }
                 });
               } catch (e) {
                 if (!mounted) return;
@@ -194,12 +212,36 @@ jobs:
               }
             }
 
+            void _cycleLayer() {
+              setState(() {
+                if (_layer == MapLayer.standard) {
+                  _layer = MapLayer.satellite;
+                } else if (_layer == MapLayer.satellite) {
+                  _layer = MapLayer.terrain;
+                } else {
+                  _layer = MapLayer.standard;
+                }
+              });
+            }
+
+            String get _layerLabel {
+              switch (_layer) {
+                case MapLayer.standard:
+                  return 'Default';
+                case MapLayer.satellite:
+                  return 'Satellite';
+                case MapLayer.terrain:
+                  return 'Terrain';
+              }
+            }
+
             Future<void> _recenter() async {
               if (_current == null) {
                 await _bootstrap();
                 return;
               }
-              _controller.move(_current!, 14);
+              setState(() => _followMe = true);
+              _controller.move(_current!, 18);
             }
 
             @override
@@ -214,6 +256,19 @@ jobs:
                 appBar: AppBar(
                   title: const Text('India Map'),
                   backgroundColor: Colors.orange,
+                  actions: [
+                    TextButton.icon(
+                      onPressed: _cycleLayer,
+                      icon: Icon(
+                        _isSatellite ? Icons.map : Icons.satellite_alt,
+                        color: Colors.white,
+                      ),
+                      label: Text(
+                        _layerLabel,
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                    ),
+                  ],
                 ),
                 body: Stack(
                   children: [
@@ -221,14 +276,19 @@ jobs:
                       mapController: _controller,
                       options: MapOptions(
                         initialCenter: _current ?? _indiaCenter,
-                        initialZoom: _current != null ? 14 : 5,
+                        initialZoom: _current != null ? 18 : 5,
                         minZoom: 3,
-                        maxZoom: 18,
-                        onTap: (_, __) {},
+                        maxZoom: 19,
+                        onPositionChanged: (pos, hasGesture) {
+                          if (hasGesture && _followMe) {
+                            setState(() => _followMe = false);
+                          }
+                        },
                       ),
                       children: [
                         TileLayer(
-                          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                          key: ValueKey(_layer),
+                          urlTemplate: _urlTemplate,
                           userAgentPackageName: 'com.indiamap.app',
                           maxZoom: 19,
                         ),
@@ -237,13 +297,9 @@ jobs:
                             markers: [
                               Marker(
                                 point: _current!,
-                                width: 60,
-                                height: 60,
-                                child: const Icon(
-                                  Icons.location_on,
-                                  color: Colors.red,
-                                  size: 50,
-                                ),
+                                width: 26,
+                                height: 26,
+                                child: _LocationDot(heading: _heading),
                               ),
                             ],
                           ),
@@ -260,6 +316,7 @@ jobs:
                       right: 12,
                       bottom: 12,
                       child: Card(
+                        color: Colors.white.withOpacity(0.92),
                         child: Padding(
                           padding: const EdgeInsets.all(10),
                           child: Text(
@@ -295,16 +352,70 @@ jobs:
                     const SizedBox(height: 8),
                     FloatingActionButton(
                       heroTag: 'locate',
+                      backgroundColor: _followMe ? Colors.orange : Colors.white,
                       onPressed: _recenter,
-                      child: const Icon(Icons.my_location),
+                      child: Icon(
+                        Icons.my_location,
+                        color: _followMe ? Colors.white : Colors.black,
+                      ),
                     ),
                   ],
                 ),
               );
             }
           }
+
+          class _LocationDot extends StatelessWidget {
+            final double heading;
+            const _LocationDot({required this.heading});
+
+            @override
+            Widget build(BuildContext context) {
+              return Stack(
+                alignment: Alignment.center,
+                children: [
+                  Container(
+                    width: 26,
+                    height: 26,
+                    decoration: BoxDecoration(
+                      color: Colors.blue.withOpacity(0.2),
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  Transform.rotate(
+                    angle: heading * 3.1415926535897932 / 180.0,
+                    child: Container(
+                      width: 18,
+                      height: 18,
+                      decoration: BoxDecoration(
+                        color: Colors.blue,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: Colors.white, width: 2),
+                        boxShadow: const [
+                          BoxShadow(
+                            color: Colors.black26,
+                            blurRadius: 4,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  Transform.rotate(
+                    angle: heading * 3.1415926535897932 / 180.0,
+                    child: Transform.translate(
+                      offset: const Offset(0, -12),
+                      child: const Icon(
+                        Icons.navigation,
+                        color: Colors.blue,
+                        size: 12,
+                      ),
+                    ),
+                  ),
+                ],
+              );
+            }
+          }
           EOF
-          echo "=== main.dart written ($(wc -l < lib/main.dart) lines) ==="
 
       - name: Force-write AndroidManifest.xml
         run: |
@@ -321,7 +432,8 @@ jobs:
               <application
                   android:label="India Map"
                   android:name="${applicationName}"
-                  android:icon="@mipmap/ic_launcher">
+                  android:icon="@mipmap/ic_launcher"
+                  android:usesCleartextTraffic="true">
                   <activity
                       android:name=".MainActivity"
                       android:exported="true"
