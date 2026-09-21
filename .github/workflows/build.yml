@@ -87,15 +87,13 @@ jobs:
           EOF
           fi
 
+          # Clean broken deps from existing pubspec.yaml
           python3 - <<'PY'
           import re, pathlib
           p = pathlib.Path("pubspec.yaml")
           txt = p.read_text()
-
-          # Remove broken/unavailable package if present
           txt = re.sub(r"^\s*flutter_map_mbtiles\s*:.*\n", "", txt, flags=re.M)
           txt = re.sub(r"^\s*maplibre_gl\s*:.*\n", "", txt, flags=re.M)
-
           required = [
               ("flutter_map", "flutter_map: ^6.1.0"),
               ("latlong2", "latlong2: ^0.9.0"),
@@ -113,10 +111,9 @@ jobs:
           if "assets:" not in txt:
               txt += "\nflutter:\n  uses-material-design: true\n  assets:\n    - assets/\n"
           p.write_text(txt)
-          print("=== FINAL pubspec.yaml ===")
-          print(txt)
           PY
 
+          # Write main.dart if missing
           if [ ! -f lib/main.dart ]; then
             cat > lib/main.dart <<'EOF'
           import 'package:flutter/material.dart';
@@ -209,26 +206,57 @@ jobs:
           EOF
           fi
 
+          # Write a clean, valid AndroidManifest.xml (overwrite any broken one)
           MANIFEST="android/app/src/main/AndroidManifest.xml"
-          if [ -f "$MANIFEST" ]; then
-            python3 - <<'PY'
-          import pathlib
-          p = pathlib.Path("android/app/src/main/AndroidManifest.xml")
-          xml = p.read_text()
-          perms = [
-              '<uses-permission android:name="android.permission.INTERNET"/>',
-              '<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>',
-              '<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>',
-              '<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>',
-              '<uses-permission android:name="android.permission.WAKE_LOCK"/>',
-          ]
-          for perm in perms:
-              if perm not in xml:
-                  xml = xml.replace("<manifest", perm + "\n<manifest", 1)
-          p.write_text(xml)
-          PY
-          fi
+          mkdir -p "$(dirname "$MANIFEST")"
+          cat > "$MANIFEST" <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
+              <application
+                  android:label="india_offline_map"
+                  android:name="${applicationName}"
+                  android:icon="@mipmap/ic_launcher">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:taskAffinity=""
+                      android:theme="@style/LaunchTheme"
+                      android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+                      android:hardwareAccelerated="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <meta-data
+                        android:name="io.flutter.embedding.android.NormalTheme"
+                        android:resource="@style/NormalTheme"
+                        />
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <meta-data
+                      android:name="flutterEmbedding"
+                      android:value="2" />
+              </application>
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.PROCESS_TEXT"/>
+                      <data android:mimeType="text/plain"/>
+                  </intent>
+              </queries>
+          </manifest>
+          EOF
+
+          # Validate XML
+          python3 -c "import xml.etree.ElementTree as ET; ET.parse('$MANIFEST'); print('Manifest is valid XML')"
+
+          # Enable AndroidX + multidex
           GP="android/gradle.properties"
           [ -f "$GP" ] || touch "$GP"
           grep -q "android.useAndroidX" "$GP" || echo "android.useAndroidX=true" >> "$GP"
